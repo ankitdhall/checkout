@@ -42,7 +42,8 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
       git,
       settings.repositoryPath,
       repositoryUrl,
-      settings.clean
+      settings.clean,
+      settings.ref
     )
   }
 
@@ -109,8 +110,17 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
 
     // Fetch
     core.startGroup('Fetching the repository')
-    const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
-    await git.fetch(settings.fetchDepth, refSpec)
+    if (settings.fetchDepth <= 0) {
+      let refSpec = refHelper.getRefSpecForAllHistory(settings.ref)
+      await git.fetch(refSpec)
+      if (settings.commit && !(await git.shaExists(settings.commit))) {
+        refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
+        await git.fetch(refSpec)
+      }
+    } else {
+      const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
+      await git.fetch(refSpec, settings.fetchDepth)
+    }
     core.endGroup()
 
     // Checkout info

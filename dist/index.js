@@ -3383,6 +3383,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const url_1 = __webpack_require__(835);
 const core = __importStar(__webpack_require__(470));
 const github = __importStar(__webpack_require__(469));
+exports.tagsRefSpec = '+refs/tags/*:refs/tags/*';
 function getCheckoutInfo(git, ref, commit) {
     return __awaiter(this, void 0, void 0, function* () {
         if (!git) {
@@ -3429,6 +3430,18 @@ function getCheckoutInfo(git, ref, commit) {
     });
 }
 exports.getCheckoutInfo = getCheckoutInfo;
+function getRefSpecForAllHistory(ref) {
+    const result = ['+refs/heads/*:refs/remotes/origin/*', exports.tagsRefSpec];
+    if (ref) {
+        const upperRef = (ref || '').toUpperCase();
+        if (ref.toUpperCase().startsWith('REFS/PULL/')) {
+            const branch = ref.substring('refs/pull/'.length);
+            result.push(`+${ref}:refs/remotes/pull/${branch}`);
+        }
+    }
+    return result;
+}
+exports.getRefSpecForAllHistory = getRefSpecForAllHistory;
 function getRefSpec(ref, commit) {
     if (!ref && !commit) {
         throw new Error('Args ref and commit cannot both be empty');
@@ -5634,6 +5647,7 @@ const exec = __importStar(__webpack_require__(986));
 const fshelper = __importStar(__webpack_require__(618));
 const io = __importStar(__webpack_require__(1));
 const path = __importStar(__webpack_require__(622));
+const refHelper = __importStar(__webpack_require__(227));
 const regexpHelper = __importStar(__webpack_require__(528));
 const retryHelper = __importStar(__webpack_require__(587));
 const git_version_1 = __webpack_require__(559);
@@ -5749,18 +5763,14 @@ class GitCommandManager {
             return output.exitCode === 0;
         });
     }
-    fetch(fetchDepth, refSpec) {
+    fetch(refSpec, fetchDepth) {
         return __awaiter(this, void 0, void 0, function* () {
-            const args = [
-                '-c',
-                'protocol.version=2',
-                'fetch',
-                '--no-tags',
-                '--prune',
-                '--progress',
-                '--no-recurse-submodules'
-            ];
-            if (fetchDepth > 0) {
+            const args = ['-c', 'protocol.version=2', 'fetch'];
+            if (!refSpec.some(x => x === refHelper.tagsRefSpec)) {
+                args.push('--no-tags');
+            }
+            args.push('--prune', '--progress', '--no-recurse-submodules');
+            if (fetchDepth) {
                 args.push(`--depth=${fetchDepth}`);
             }
             else if (fshelper.fileExistsSync(path.join(this.workingDirectory, '.git', 'shallow'))) {
@@ -5821,6 +5831,13 @@ class GitCommandManager {
     }
     setEnvironmentVariable(name, value) {
         this.gitEnv[name] = value;
+    }
+    shaExists(sha) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const args = ['rev-parse', '--verify', '--quiet', `${sha}^{object}`];
+            const output = yield this.execGit(args, true);
+            return output.exitCode === 0;
+        });
     }
     submoduleForeach(command, recursive) {
         return __awaiter(this, void 0, void 0, function* () {
@@ -6060,7 +6077,7 @@ function getSource(settings) {
         core.endGroup();
         // Prepare existing directory, otherwise recreate
         if (isExisting) {
-            yield gitDirectoryHelper.prepareExistingDirectory(git, settings.repositoryPath, repositoryUrl, settings.clean);
+            yield gitDirectoryHelper.prepareExistingDirectory(git, settings.repositoryPath, repositoryUrl, settings.clean, settings.ref);
         }
         if (!git) {
             // Downloading using REST API
@@ -6102,8 +6119,18 @@ function getSource(settings) {
             }
             // Fetch
             core.startGroup('Fetching the repository');
-            const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
-            yield git.fetch(settings.fetchDepth, refSpec);
+            if (settings.fetchDepth <= 0) {
+                let refSpec = refHelper.getRefSpecForAllHistory(settings.ref);
+                yield git.fetch(refSpec);
+                if (settings.commit && !(yield git.shaExists(settings.commit))) {
+                    refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
+                    yield git.fetch(refSpec);
+                }
+            }
+            else {
+                const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
+                yield git.fetch(refSpec, settings.fetchDepth);
+            }
             core.endGroup();
             // Checkout info
             core.startGroup('Determining the checkout info');
@@ -7454,7 +7481,7 @@ const fs = __importStar(__webpack_require__(747));
 const fsHelper = __importStar(__webpack_require__(618));
 const io = __importStar(__webpack_require__(1));
 const path = __importStar(__webpack_require__(622));
-function prepareExistingDirectory(git, repositoryPath, repositoryUrl, clean) {
+function prepareExistingDirectory(git, repositoryPath, repositoryUrl, clean, ref) {
     return __awaiter(this, void 0, void 0, function* () {
         assert.ok(repositoryPath, 'Expected repositoryPath to be defined');
         assert.ok(repositoryUrl, 'Expected repositoryUrl to be defined');
@@ -7494,10 +7521,24 @@ function prepareExistingDirectory(git, repositoryPath, repositoryUrl, clean) {
                 for (const branch of branches) {
                     yield git.branchDelete(false, branch);
                 }
-                // Remove all refs/remotes/origin/* to avoid conflicts
-                branches = yield git.branchList(true);
-                for (const branch of branches) {
-                    yield git.branchDelete(true, branch);
+                // Remove any conflicting refs/remotes/origin/*
+                // Example 1: Consider ref is refs/heads/foo and previously fetched refs/remotes/origin/foo/bar
+                // Example 2: Consider ref is refs/heads/foo/bar and previously fetched refs/remotes/origin/foo
+                if (ref) {
+                    ref = ref.startsWith('refs/') ? ref : `refs/heads/${ref}`;
+                    if (ref.startsWith('refs/heads/')) {
+                        const upperName1 = ref.toUpperCase().substr('REFS/HEADS/'.length);
+                        const upperName1Slash = `${upperName1}/`;
+                        branches = yield git.branchList(true);
+                        for (const branch of branches) {
+                            const upperName2 = branch.substr('origin/'.length).toUpperCase();
+                            const upperName2Slash = `${upperName2}/`;
+                            if (upperName1.startsWith(upperName2Slash) ||
+                                upperName2.startsWith(upperName1Slash)) {
+                                yield git.branchDelete(true, branch);
+                            }
+                        }
+                    }
                 }
                 core.endGroup();
                 // Clean
